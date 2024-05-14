@@ -51,6 +51,7 @@ def get_args():
     parser.add_argument('--model_ema', action='store_true', default=False)
     parser.add_argument('--model_ema_decay', type=float, default=0.9999, help='')
     parser.add_argument('--model_ema_force_cpu', action='store_true', default=False, help='')
+    parser.add_argument('--linear', action='store_true', default=False, help='Use a linear probe')
 
     # Optimizer parameters
     parser.add_argument('--opt', default='adamw', type=str, metavar='OPTIMIZER',
@@ -181,7 +182,7 @@ def get_args():
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
-    parser.add_argument('--local_rank', default=-1, type=int)
+    parser.add_argument('--local-rank', default=-1, type=int)
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
@@ -314,6 +315,7 @@ def main(args, ds_init):
         use_checkpoint=args.use_checkpoint,
         use_mean_pooling=args.use_mean_pooling,
         init_scale=args.init_scale,
+        linear_probe=args.linear
     )
 
     patch_size = model.patch_embed.patch_size
@@ -358,10 +360,10 @@ def main(args, ds_init):
         if 'pos_embed' in checkpoint_model:
             pos_embed_checkpoint = checkpoint_model['pos_embed']
             embedding_size = pos_embed_checkpoint.shape[-1] # channel dim
-            num_patches = model.patch_embed.num_patches # 
+            num_patches = model.patch_embed.num_patches #
             num_extra_tokens = model.pos_embed.shape[-2] - num_patches # 0/1
 
-            # height (== width) for the checkpoint position embedding 
+            # height (== width) for the checkpoint position embedding
             orig_size = int(((pos_embed_checkpoint.shape[-2] - num_extra_tokens)//(args.num_frames // model.patch_embed.tubelet_size)) ** 0.5)
             # height (== width) for the new position embedding
             new_size = int((num_patches // (args.num_frames // model.patch_embed.tubelet_size) )** 0.5)
@@ -377,13 +379,14 @@ def main(args, ds_init):
                 pos_tokens = torch.nn.functional.interpolate(
                     pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
                 # BT, C, H, W -> BT, H, W, C ->  B, T, H, W, C
-                pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(-1, args.num_frames // model.patch_embed.tubelet_size, new_size, new_size, embedding_size) 
+                pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(-1, args.num_frames // model.patch_embed.tubelet_size, new_size, new_size, embedding_size)
                 pos_tokens = pos_tokens.flatten(1, 3) # B, L, C
                 new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
                 checkpoint_model['pos_embed'] = new_pos_embed
 
         utils.load_state_dict(model, checkpoint_model, prefix=args.model_prefix)
 
+    print('Total Learnable Params:', sum(p.numel() for p in model.parameters() if p.requires_grad))
     model.to(device)
 
     model_ema = None

@@ -27,7 +27,7 @@ class DropPath(nn.Module):
 
     def forward(self, x):
         return drop_path(x, self.drop_prob, self.training)
-    
+
     def extra_repr(self) -> str:
         return 'p={}'.format(self.drop_prob)
 
@@ -46,7 +46,7 @@ class Mlp(nn.Module):
         x = self.fc1(x)
         x = self.act(x)
         # x = self.drop(x)
-        # commit this for the orignal BERT implement 
+        # commit this for the orignal BERT implement
         x = self.fc2(x)
         x = self.drop(x)
         return x
@@ -55,7 +55,7 @@ class Mlp(nn.Module):
 class Attention(nn.Module):
     def __init__(
             self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0.,
-            proj_drop=0., attn_head_dim=None):
+            proj_drop=0., attn_head_dim=None, k_bias=False):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -68,32 +68,52 @@ class Attention(nn.Module):
         if qkv_bias:
             self.q_bias = nn.Parameter(torch.zeros(all_head_dim))
             self.v_bias = nn.Parameter(torch.zeros(all_head_dim))
+            self.k_bias = nn.Parameter(torch.zeros(all_head_dim))
         else:
             self.q_bias = None
             self.v_bias = None
+            self.k_bias = None
+
+        if k_bias:
+            self.k_bias = None
 
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(all_head_dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
+        self.flash_attention = True
+        if self.flash_attention:
+            from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
+            self.fa = flash_attn_qkvpacked_func
+
+
     def forward(self, x):
         B, N, C = x.shape
         qkv_bias = None
         if self.q_bias is not None:
-            qkv_bias = torch.cat((self.q_bias, torch.zeros_like(self.v_bias, requires_grad=False), self.v_bias))
+            if self.k_bias is None:
+                qkv_bias = torch.cat((self.q_bias, torch.zeros_like(self.v_bias, requires_grad=False), self.v_bias))
+            else:
+                qkv_bias = torch.cat((self.q_bias, self.k_bias, self.v_bias))
         # qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)
         qkv = qkv.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
         q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
 
-        
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, -1)
+        if self.flash_attention:
+            qkv = torch.stack([q, k, v], 0)
+            qkv = qkv.permute(1, 3, 0, 2, 4)  # .shape # (B, S, 3, H, D)
+            # breakpoint()
+            x = self.fa(qkv, dropout_p=0.0, softmax_scale=1., causal=False)
+            x = x.permute(0, 2, 1, 3)
+        else:
+            attn = (q @ k.transpose(-2, -1))
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = attn @ v
+        x = x.transpose(1, 2).reshape(B, N, -1)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -103,12 +123,12 @@ class Block(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., init_values=None, act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 attn_head_dim=None):
+                 attn_head_dim=None, k_bias=False):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
-            attn_drop=attn_drop, proj_drop=drop, attn_head_dim=attn_head_dim)
+            attn_drop=attn_drop, proj_drop=drop, attn_head_dim=attn_head_dim, k_bias=k_bias)
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -143,8 +163,8 @@ class PatchEmbed(nn.Module):
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = num_patches
-        self.proj = nn.Conv3d(in_channels=in_chans, out_channels=embed_dim, 
-                            kernel_size = (self.tubelet_size,  patch_size[0],patch_size[1]), 
+        self.proj = nn.Conv3d(in_channels=in_chans, out_channels=embed_dim,
+                            kernel_size = (self.tubelet_size,  patch_size[0],patch_size[1]),
                             stride=(self.tubelet_size,  patch_size[0],  patch_size[1]))
 
     def forward(self, x, **kwargs):
@@ -154,49 +174,53 @@ class PatchEmbed(nn.Module):
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
         x = self.proj(x).flatten(2).transpose(1, 2)
         return x
-    
+
 # sin-cos position encoding
 # https://github.com/jadore801120/attention-is-all-you-need-pytorch/blob/master/transformer/Models.py#L31
-def get_sinusoid_encoding_table(n_position, d_hid): 
-    ''' Sinusoid position encoding table ''' 
-    # TODO: make it with torch instead of numpy 
-    def get_position_angle_vec(position): 
-        return [position / np.power(10000, 2 * (hid_j // 2) / d_hid) for hid_j in range(d_hid)] 
+def get_sinusoid_encoding_table(n_position, d_hid):
+    ''' Sinusoid position encoding table '''
+    # TODO: make it with torch instead of numpy
+    def get_position_angle_vec(position):
+        return [position / np.power(10000, 2 * (hid_j // 2) / d_hid) for hid_j in range(d_hid)]
 
-    sinusoid_table = np.array([get_position_angle_vec(pos_i) for pos_i in range(n_position)]) 
-    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2]) # dim 2i 
-    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2]) # dim 2i+1 
+    sinusoid_table = np.array([get_position_angle_vec(pos_i) for pos_i in range(n_position)])
+    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2]) # dim 2i
+    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2]) # dim 2i+1
 
-    return  torch.tensor(sinusoid_table,dtype=torch.float, requires_grad=False).unsqueeze(0) 
+    return  torch.tensor(sinusoid_table,dtype=torch.float, requires_grad=False).unsqueeze(0)
 
 
 class VisionTransformer(nn.Module):
     """ Vision Transformer with support for patch or hybrid CNN input stage
     """
-    def __init__(self, 
-                 img_size=224, 
-                 patch_size=16, 
-                 in_chans=3, 
-                 num_classes=1000, 
-                 embed_dim=768, 
+    def __init__(self,
+                 img_size=224,
+                 patch_size=16,
+                 in_chans=3,
+                 num_classes=1000,
+                 embed_dim=768,
                  depth=12,
-                 num_heads=12, 
-                 mlp_ratio=4., 
-                 qkv_bias=False, 
-                 qk_scale=None, 
-                 fc_drop_rate=0., 
-                 drop_rate=0., 
+                 num_heads=12,
+                 mlp_ratio=4.,
+                 qkv_bias=False,
+                 qk_scale=None,
+                 fc_drop_rate=0.,
+                 drop_rate=0.,
                  attn_drop_rate=0.,
-                 drop_path_rate=0., 
-                 norm_layer=nn.LayerNorm, 
+                 drop_path_rate=0.,
+                 norm_layer=nn.LayerNorm,
                  init_values=0.,
-                 use_learnable_pos_emb=False, 
+                 use_learnable_pos_emb=False,
                  init_scale=0.,
                  all_frames=16,
                  tubelet_size=2,
                  use_checkpoint=False,
-                 use_mean_pooling=True):
+                 use_mean_pooling=True,
+                 mode='vmae',
+                 linear_probe=False):
         super().__init__()
+        self.mode = mode
+        self.linear_probe = linear_probe
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.tubelet_size = tubelet_size
@@ -204,6 +228,8 @@ class VisionTransformer(nn.Module):
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim, num_frames=all_frames, tubelet_size=self.tubelet_size)
         num_patches = self.patch_embed.num_patches
         self.use_checkpoint = use_checkpoint
+        self.num_patches = int((img_size / patch_size) ** 2)
+        self.num_frames = all_frames
 
         if use_learnable_pos_emb:
             self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
@@ -219,21 +245,36 @@ class VisionTransformer(nn.Module):
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
-                init_values=init_values)
+                init_values=init_values, k_bias=(self.mode == 'cwm'))
             for i in range(depth)])
         self.norm = nn.Identity() if use_mean_pooling else norm_layer(embed_dim)
         self.fc_norm = norm_layer(embed_dim) if use_mean_pooling else None
         self.fc_dropout = nn.Dropout(p=fc_drop_rate) if fc_drop_rate > 0 else nn.Identity()
-        self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
+        if (not self.linear_probe) and self.mode == 'cwm':
+            # Matching VideoMAE's num of parameters
+            self.head = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim),
+                nn.Linear(embed_dim, embed_dim),
+                nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity(),
+            )
+            for head in self.head:
+                head.weight.data.mul_(init_scale)
+                head.bias.data.mul_(init_scale)
+                trunc_normal_(head.weight, std=.02)
+        else:
+            self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+            self.head.weight.data.mul_(init_scale)
+            self.head.bias.data.mul_(init_scale)
+            trunc_normal_(self.head.weight, std=.02)
         if use_learnable_pos_emb:
             trunc_normal_(self.pos_embed, std=.02)
 
-        trunc_normal_(self.head.weight, std=.02)
-        self.apply(self._init_weights)
 
-        self.head.weight.data.mul_(init_scale)
-        self.head.bias.data.mul_(init_scale)
+        self.apply(self._init_weights)
+        self.mask_buffer = None
+
+
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -259,6 +300,7 @@ class VisionTransformer(nn.Module):
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
     def forward_features(self, x):
+
         x = self.patch_embed(x)
         B, _, _ = x.size()
 
@@ -269,7 +311,7 @@ class VisionTransformer(nn.Module):
         if self.use_checkpoint:
             for blk in self.blocks:
                 x = checkpoint.checkpoint(blk, x)
-        else:   
+        else:
             for blk in self.blocks:
                 x = blk(x)
 
@@ -279,8 +321,65 @@ class VisionTransformer(nn.Module):
         else:
             return x[:, 0]
 
+    def forward_feature_cwm(self, x):
+        feature_list = []
+        original_x = x.clone() # [B, C, T, H, W]
+
+        # Generate CWM masks
+        zeros_mask = torch.zeros(x.shape[0], self.num_patches * (self.num_frames - 1))
+        num_masked = int(self.num_patches * 0.9) # Fixme: hard-coded 90% mask ratio
+        ones_mask = torch.randn(x.shape[0], self.num_patches)
+        topk = torch.topk(ones_mask, num_masked, dim=1).values
+        ones_mask = ones_mask >= topk[:, -1:]
+
+        if (ones_mask.sum(-1) != num_masked).any():
+            mask = self.mask_buffer
+        else:
+            mask = torch.cat([zeros_mask, ones_mask], dim=1).to(x.device).type_as(x).detach().bool()
+            self.mask_buffer = mask
+        # Iterate through 16 frames # Fixme: hard-coded 16 frames
+
+        for i in range(8):
+
+            x = original_x[:, :, 2*i:2*i+3]
+            if x.shape[2] < 3:
+                x = torch.cat([x, x[:, :, -1:]], dim=2)
+
+            x = self.patch_embed(x)
+
+            B, _, C = x.size()
+
+            if self.pos_embed is not None:
+                x = x + self.pos_embed.expand(B, -1, -1).type_as(x).to(x.device).clone().detach()
+            x = self.pos_drop(x)
+
+            x = x[~mask].view(B, -1, C)
+
+            if self.use_checkpoint:
+                for blk in self.blocks:
+                    x = checkpoint.checkpoint(blk, x)
+            else:
+                for blk in self.blocks:
+                    x = blk(x)
+            feature_list.append(x)
+
+        x = torch.cat(feature_list, dim=1)
+        x = self.norm(x)
+        if self.fc_norm is not None:
+            return self.fc_norm(x.mean(1))
+        else:
+            return x[:, 0]
+
+
     def forward(self, x):
-        x = self.forward_features(x)
+        func = self.forward_feature_cwm if self.mode == 'cwm' else self.forward_feature
+        if self.linear_probe:
+            with torch.no_grad():
+                x = func(x)
+            x = x.detach()
+        else:
+            x = func(x)
+
         x = self.head(self.fc_dropout(x))
         return x
 
@@ -299,6 +398,17 @@ def vit_base_patch16_224(pretrained=False, **kwargs):
     model = VisionTransformer(
         patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    model.default_cfg = _cfg()
+    return model
+
+@register_model
+def vit_base_patch16_224_cwm(pretrained=False, **kwargs):
+    kwargs['all_frames'] = 3
+    kwargs['tubelet_size'] = 1
+
+    model = VisionTransformer(
+        patch_size=8, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), mode='cwm', **kwargs)
     model.default_cfg = _cfg()
     return model
 

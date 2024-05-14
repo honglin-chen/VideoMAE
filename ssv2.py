@@ -77,17 +77,21 @@ class SSVideoClsDataset(Dataset):
                         self.test_seg.append((ck, cp))
 
     def __getitem__(self, index):
+        replace_str = "YOUR_PATH/20bn-something-something-v2"
+        new_str = "/data2/honglinc/SomethingSomethingV2_mp4_v2/20bn-something-something-v2_320p"
         if self.mode == 'train':
             args = self.args 
             scale_t = 1
 
             sample = self.dataset_samples[index]
+            sample = sample.replace(replace_str, new_str)
             buffer = self.loadvideo_decord(sample, sample_rate_scale=scale_t) # T H W C
             if len(buffer) == 0:
                 while len(buffer) == 0:
                     warnings.warn("video {} not correctly loaded during training".format(sample))
                     index = np.random.randint(self.__len__())
                     sample = self.dataset_samples[index]
+                    sample = sample.replace(replace_str, new_str)
                     buffer = self.loadvideo_decord(sample, sample_rate_scale=scale_t)
 
             if args.num_sample > 1:
@@ -108,18 +112,21 @@ class SSVideoClsDataset(Dataset):
 
         elif self.mode == 'validation':
             sample = self.dataset_samples[index]
+            sample = sample.replace(replace_str, new_str)
             buffer = self.loadvideo_decord(sample)
             if len(buffer) == 0:
                 while len(buffer) == 0:
                     warnings.warn("video {} not correctly loaded during validation".format(sample))
                     index = np.random.randint(self.__len__())
                     sample = self.dataset_samples[index]
+                    sample = sample.replace(replace_str, new_str)
                     buffer = self.loadvideo_decord(sample)
             buffer = self.data_transform(buffer)
             return buffer, self.label_array[index], sample.split("/")[-1].split(".")[0]
 
         elif self.mode == 'test':
             sample = self.test_dataset[index]
+            sample = sample.replace(replace_str, new_str)
             chunk_nb, split_nb = self.test_seg[index]
             buffer = self.loadvideo_decord(sample)
 
@@ -128,6 +135,7 @@ class SSVideoClsDataset(Dataset):
                     str(self.test_dataset[index]), chunk_nb, split_nb))
                 index = np.random.randint(self.__len__())
                 sample = self.test_dataset[index]
+                sample = sample.replace(replace_str, new_str)
                 chunk_nb, split_nb = self.test_seg[index]
                 buffer = self.loadvideo_decord(sample)
 
